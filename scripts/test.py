@@ -3,7 +3,7 @@ import pandas as pd
 import os
 
 DB_PATH = 'data/7shifts_nyc_data.db'
-OUTPUT_PATH = 'outputs/activation_ready_dump.csv'
+OUTPUT_PATH = 'outputs/fct_activation_ready_dump.csv'
 
 def export_table():
     # Ensure output directory exists

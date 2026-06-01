@@ -10,24 +10,47 @@ WITH crm AS (
     FROM {{ ref('stg_crm_accounts') }}
 ),
 
+-- 1. Apply business logic to filter out massive enterprise chains
+target_companies AS (
+    SELECT * FROM {{ ref('stg_companies') }}
+    WHERE num_locations <= 50 OR num_locations IS NULL
+),
+
+-- 2. Apply business logic to filter out non-restaurant retail and remove dead locations
+target_locations AS (
+    SELECT * FROM {{ ref('stg_locations') }}
+    WHERE business_type IN (
+        '["Restaurant"]',
+        '["Coffee Shop"]',
+        '["Dessert & Bakery"]',
+        '["Juice Bar"]',
+        '["Bar"]'
+    )
+    AND operational_status = 'OPERATIONAL'
+),
+
+-- 3. Aggregate using the newly filtered CTEs
 vendor_signals_agg AS (
     SELECT 
         c.account_id AS vendor_id,
         c.company_name AS vendor_name,
         c.website AS vendor_website,
         LOWER(REPLACE(REPLACE(c.website, 'www.', ''), 'https://', '')) AS clean_domain,
-        c.num_locations AS global_location_count,
+        COUNT(location_id) AS global_location_count,
         c.pos_vendor AS vendor_pos,
-        SUM(CASE WHEN l.city IN ('New York', 'Brooklyn', 'Queens', 'Bronx', 'Staten Island') THEN 1 ELSE 0 END) AS total_nyc_locations,
-        ROUND(AVG(CASE WHEN l.city IN ('New York', 'Brooklyn', 'Queens', 'Bronx', 'Staten Island') THEN l.review_rating ELSE NULL END), 1) AS avg_nyc_rating,
+        COUNT(DISTINCT CASE WHEN l.city IN ('New York', 'Brooklyn', 'Queens', 'Bronx', 'Staten Island', 'Flushing', 'Astoria', 'Long Island City', 'Jackson Heights') THEN l.google_place_id ELSE NULL END) AS total_nyc_locations,
+        ROUND(
+            SUM(l.review_rating * l.num_reviews) / NULLIF(SUM(l.num_reviews), 0), 
+            1
+        ) AS avg_nyc_rating,
         GROUP_CONCAT(DISTINCT LOWER(l.cuisine_type)) AS cuisines
-    FROM {{ ref('stg_companies') }} c
-    LEFT JOIN {{ ref('stg_locations') }} l ON c.account_id = l.account_id
-    GROUP BY c.account_id, c.company_name, c.website, c.num_locations, c.pos_vendor
+    FROM target_companies c
+    LEFT JOIN target_locations l ON c.account_id = l.account_id
+    GROUP BY c.account_id, c.company_name, c.website, c.pos_vendor
 ),
 
+-- 4. Initial deterministic join on domain names
 master_join AS (
-    -- Simulating FULL OUTER JOIN
     SELECT 
         COALESCE(c.clean_domain, v.clean_domain) AS primary_domain,
         c.company_id,
@@ -43,73 +66,52 @@ master_join AS (
         v.vendor_pos,
         v.cuisines
     FROM crm c
-    LEFT JOIN vendor_signals_agg v ON c.clean_domain = v.clean_domain
-    
-    UNION
-    
-    SELECT 
-        COALESCE(c.clean_domain, v.clean_domain) AS primary_domain,
-        c.company_id,
-        c.company_name AS crm_name,
-        c.crm_plan,
-        c.crm_location_count,
-        v.vendor_id,
-        v.vendor_name,
-        v.vendor_website,
-        v.global_location_count,
-        v.total_nyc_locations,
-        v.avg_nyc_rating,
-        v.vendor_pos,
-        v.cuisines
-    FROM vendor_signals_agg v
-    LEFT JOIN crm c ON v.clean_domain = c.clean_domain
+    FULL OUTER JOIN vendor_signals_agg v 
+        ON c.clean_domain = v.clean_domain
 ),
 
-segmentation_layer AS (
+-- 5. Calculate base metrics and dynamic market percentiles
+base_metrics AS (
     SELECT 
-        primary_domain, 
-        company_id, 
-        crm_name, 
-        crm_plan, 
-        crm_location_count, 
-        vendor_id, 
-        vendor_name, 
-        vendor_website, 
-        global_location_count, 
-        total_nyc_locations, 
-        avg_nyc_rating, 
-        vendor_pos, 
-        cuisines, 
+        *,
         (COALESCE(global_location_count, 0) - COALESCE(crm_location_count, 0)) AS location_whitespace,
+        
+        -- Window functions calculating relative percentile rank (0.0 to 1.0)
+        PERCENT_RANK() OVER (ORDER BY COALESCE(total_nyc_locations, 0) ASC) AS market_footprint_percentile,
+        PERCENT_RANK() OVER (ORDER BY COALESCE(avg_nyc_rating, 0) ASC) AS market_rating_percentile
+    FROM master_join
+),
+
+-- 6. Apply dynamic segmentation matrix
+final_segments AS (
+    SELECT 
+        *,
+        ((market_footprint_percentile + market_rating_percentile) / 2.0) AS composite_influence_score,
+        
         CASE 
-            -- Tier 1 & 2: Successfully Joined Records
-            WHEN company_id IS NOT NULL AND vendor_id IS NOT NULL AND total_nyc_locations >= 3 AND avg_nyc_rating >= 4.0 THEN 'CREDIBLE_PARTNER'
-            WHEN company_id IS NOT NULL AND vendor_id IS NOT NULL AND ((COALESCE(global_location_count, 0) - COALESCE(crm_location_count, 0)) >= 2 OR crm_plan IN ('Essentials', 'Comp')) THEN 'EXPANSION_OPPORTUNITY'
-            -- Pipeline Pass-Through: Orphaned CRM Records sent to Gemini
+            -- Priority 0: Protect the system from unmatched data ghosts
             WHEN company_id IS NOT NULL AND vendor_id IS NULL THEN 'PENDING_RESOLUTION'
-            -- Pipeline Pass-Through: Orphaned Vendor Records
-            WHEN company_id IS NULL AND vendor_id IS NOT NULL AND total_nyc_locations >= 1 THEN 'NET_NEW_TARGET'
-            -- Catch-All
+            
+            -- Priority 1: Cross-sell revenue overrides everything else.
+            WHEN company_id IS NOT NULL AND vendor_id IS NOT NULL 
+                 AND (location_whitespace >= 1 OR crm_plan IN ('Essentials', 'Comp'))
+            THEN 'EXPANSION_OPPORTUNITY'
+            
+            -- Priority 2: Strategic Land (Net-New prospect in the top 50% of the market)
+            WHEN company_id IS NULL AND vendor_id IS NOT NULL 
+                 AND ((market_footprint_percentile + market_rating_percentile) / 2.0) >= 0.5 
+            THEN 'NET_NEW_TARGET'
+            
+            -- Priority 3: The Advocate / VIP (Existing customer, fully deployed, top 20% influence)
+            WHEN company_id IS NOT NULL AND vendor_id IS NOT NULL 
+                 AND location_whitespace <= 0
+                 AND ((market_footprint_percentile + market_rating_percentile) / 2.0) >= 0.8
+            THEN 'CREDIBLE_PARTNER'
+            
+            -- Fallback: Bottom 50% of prospects and un-influential SMB customers
             ELSE 'UNCLASSIFIED'
         END AS gtm_segment
-    FROM master_join
+    FROM base_metrics
 )
 
-SELECT 
-    primary_domain, 
-    company_id, 
-    crm_name, 
-    crm_plan, 
-    crm_location_count, 
-    vendor_id, 
-    vendor_name, 
-    vendor_website, 
-    global_location_count, 
-    total_nyc_locations, 
-    avg_nyc_rating, 
-    vendor_pos, 
-    cuisines, 
-    location_whitespace,
-    gtm_segment
-FROM segmentation_layer
-WHERE gtm_segment != 'UNCLASSIFIED'
+SELECT * FROM final_segments

@@ -2,35 +2,32 @@
 Phase 2: Signal Engineering & Activation Scrubbing
 --------------------------------------------------
 This script performs targeted external enrichment and franchise detection 
-on the resolved master dataset. It persists the final, activation-ready 
-dataset to the warehouse 'fct_activation_ready' table.
+using a headless browser to render SPA frameworks. It augments the dataset
+with franchise classifications and persists the entirety to 'fct_activation_ready'.
 """
 
 import pandas as pd
 import logging
-import requests
 import sqlite3
+import re
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright_stealth import stealth_sync
 
-# Suppress noisy HTTP/library logs
+# Setup logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 DB_PATH = 'data/7shifts_nyc_data.db'
 
-def check_franchise_footprint(url: str) -> bool:
-    """Performs a heuristic check for franchise markers on a given website."""
-    if pd.isna(url) or not isinstance(url, str): return False
-    target_url = url if url.startswith(('http://', 'https://')) else f"https://{url}"
-    try:
-        # 5-second timeout strikes balance between thoroughness and speed
-        response = requests.get(target_url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
-        if response.status_code == 200:
-            html = response.text.lower()
-            return any(m in html for m in ['franchising', 'franchise opportunities', 'own a location'])
-    except Exception: 
-        # Log failure silently for individual sites to ensure pipeline continues
-        return False
-    return False
+# Strict regex patterns to avoid false positives on press articles
+FRANCHISE_KEYWORDS = [
+    r'\bfranchise opportunities\b',
+    r'\bown a franchise\b',
+    r'\bbecome a franchisee\b',
+    r'\bfranchise information\b',
+    r'\bown a location\b',
+    r'\bfranchising with us\b'
+]
+FRANCHISE_PATTERN = re.compile('|'.join(FRANCHISE_KEYWORDS), re.IGNORECASE)
 
 def run_signal_engineering():
     logging.info("Starting Phase 2: External Scraping & Franchise Scrubbing")
@@ -39,32 +36,87 @@ def run_signal_engineering():
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query("SELECT * FROM fct_master_dataset", conn)
     
-    # 2. Heuristic Franchise Detection
-    # Filter for high-risk vendors (30+ global locations)
-    high_risk = df[(df['global_location_count'] >= 30) & (df['vendor_website'].notna())]
+    # 2. Initialize Augmentation Columns (Fixing the Pandas dtype warning)
+    df['is_franchise'] = pd.Series(dtype='object')
+    df['is_franchise'] = False # Default to False, but column allows strings now
+    df['franchise_evidence'] = None
+    df['scrape_status'] = 'UNATTEMPTED'
     
-    logging.info(f"Detected {len(high_risk)} high-risk vendors for deep-scrape.")
+    # 3. Identify High-Risk Vendors (7+ locations with valid websites)
+    mask = (df['global_location_count'] >= 7) & (df['vendor_website'].notna()) & (df['vendor_website'] != '')
+    high_risk_indices = df[mask].index
     
-    franchise_ids = []
+    logging.info(f"Detected {len(high_risk_indices)} high-risk vendors for deep-scrape.")
     
-    # Iterate with progressive logging for terminal observability
-    for idx, row in high_risk.iterrows():
-        logging.info(f"Checking {idx+1}/{len(high_risk)}: {row['vendor_name']}...")
+    # 4. Headless Browser Execution
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080}
+        )
+        page = context.new_page()
         
-        if check_franchise_footprint(row['vendor_website']):
-            logging.info(f" -> FRANCHISE DETECTED (Scrubbing): {row['vendor_name']}")
-            franchise_ids.append(row['vendor_id'])
-        else:
-            logging.info(f" -> PASS: {row['vendor_name']} verified as independent.")
+        for idx in high_risk_indices:
+            vendor_name = df.at[idx, 'vendor_name']
+            raw_url = df.at[idx, 'vendor_website']
+            
+            target_url = raw_url if raw_url.startswith(('http://', 'https://')) else f"https://{raw_url}"
+            logging.info(f"Checking {vendor_name} ({target_url})...")
+            
+            try:
+                # INJECT STEALTH HERE TO BYPASS WAF DROPS
+                stealth_sync(page)
+                
+                # FIX: Changed to domcontentloaded to avoid infinite tracker loops
+                response = page.goto(target_url, timeout=20000, wait_until='domcontentloaded')
+                
+                if response is None:
+                    df.at[idx, 'scrape_status'] = 'FAILED_NO_RESPONSE'
+                    df.at[idx, 'is_franchise'] = 'UNKNOWN'
+                    logging.warning(f" -> UNKNOWN: {vendor_name} (No response from server)")
+                    continue
+                    
+                status = response.status
+                df.at[idx, 'scrape_status'] = str(status)
+                
+                if status >= 400:
+                    df.at[idx, 'is_franchise'] = 'UNKNOWN'
+                    logging.warning(f" -> UNKNOWN: {vendor_name} (HTTP {status})")
+                    continue
+                    
+                # Extract the physically rendered innerText
+                body_text = page.inner_text('body')
+                
+                # Execute strict heuristic check
+                match = FRANCHISE_PATTERN.search(body_text)
+                
+                if match:
+                    df.at[idx, 'is_franchise'] = True
+                    df.at[idx, 'franchise_evidence'] = match.group(0)
+                    logging.info(f" -> FRANCHISE DETECTED: {vendor_name} (Evidence: '{match.group(0)}')")
+                else:
+                    df.at[idx, 'is_franchise'] = False
+                    logging.info(f" -> PASS: {vendor_name} verified as independent.")
+                    
+            except PlaywrightTimeoutError:
+                df.at[idx, 'scrape_status'] = 'TIMEOUT'
+                df.at[idx, 'is_franchise'] = 'UNKNOWN'
+                logging.warning(f" -> UNKNOWN: {vendor_name} (Timeout - Site too slow or blocked bot)")
+            except Exception as e:
+                # Extract the exact Chromium network reason (e.g., net::ERR_CONNECTION_RESET)
+                error_msg = str(e).split('\n')[0] 
+                df.at[idx, 'scrape_status'] = f"ERROR: {error_msg}"
+                df.at[idx, 'is_franchise'] = 'UNKNOWN'
+                logging.warning(f" -> UNKNOWN: {vendor_name} (Error: {error_msg})")
+        
+        browser.close()
     
-    # 3. Final Activation Scrub
-    df_final = df[~df['vendor_id'].isin(franchise_ids)].copy()
-    
-    # 4. Write back to the warehouse as the final activation table
-    df_final.to_sql('fct_activation_ready', conn, if_exists='replace', index=False)
+    # 5. Write the full, augmented dataset to the warehouse
+    df.to_sql('fct_activation_ready', conn, if_exists='replace', index=False)
     conn.close()
     
-    logging.info(f"Phase 2 Complete. {len(df_final)} records persisted to 'fct_activation_ready'.")
+    logging.info(f"Phase 2 Complete. {len(df)} records safely persisted to 'fct_activation_ready'.")
 
 if __name__ == "__main__":
     run_signal_engineering()

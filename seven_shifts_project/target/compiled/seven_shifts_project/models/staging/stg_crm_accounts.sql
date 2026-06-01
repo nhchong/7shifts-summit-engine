@@ -1,1 +1,0 @@
-SELECT * FROM main."crm_accounts"
