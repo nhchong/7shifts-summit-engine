@@ -1,9 +1,10 @@
 """
-Phase 3: Stakeholder Selection & Export UI
-------------------------------------------
-Streamlit application for interactive audience filtering, 
-message drafting, context generation, and compliant Excel export.
-Includes a Two-Pass Hyper-Personalization Loop for Sales Reps.
+Phase 3: GTM Stakeholder UI & Activation Layer
+----------------------------------------------
+Serves as the final presentation layer. This Streamlit application allows the 
+Go-To-Market (GTM) team to interactively filter the enriched data, trigger 
+LLM-based personalized outreach drafting, and export the finalized pipeline 
+into a dual-sheet Excel format for activation.
 """
 
 import streamlit as st
@@ -17,29 +18,41 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
-# Page Config
+# --- Initialization ---
 st.set_page_config(page_title="7shifts Summit Selector", layout="wide")
 load_dotenv()
 
 @st.cache_data
 def load_data():
+    """
+    Fetches the materialized target list from SQLite.
+    Caches the payload in memory to prevent expensive disk I/O during UI re-renders.
+    Strictly filters out any entities flagged as franchises during Phase 2.
+    """
     conn = sqlite3.connect('data/7shifts_nyc_data.db')
     df = pd.read_sql_query("SELECT * FROM fct_activation_ready", conn)
     conn.close()
     
+    # Cast to string and normalize to safely catch varied boolean/string database representations
     df['is_franchise_str'] = df['is_franchise'].astype(str).str.strip().str.upper()
     return df[df['is_franchise_str'].isin(['0', '0.0', 'FALSE', 'UNKNOWN'])]
 
 def generate_messaging_and_context(selected_df):
-    """Generates structured JSON containing both drafts and sales rationale, factoring in rep notes."""
+    """
+    Orchestrates few-shot LLM inference to generate hyper-personalized sales drafts.
+    Enforces a strict JSON schema return to ensure predictable parsing into the dataframe.
+    """
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
     drafts = []
     contexts = []
     
+    # UI hooks for batch processing vvisibility
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     for i, (_, row) in enumerate(selected_df.iterrows()):
+        # 1. Variable Extraction & Fallback Handling
+        # Coalesce nulls into natural language fallbacks to prevent prompt structural failure
         name = row['crm_name'] if pd.notna(row['crm_name']) and row['crm_name'] != '' else row['vendor_name']
         cuisine = row['cuisines'] if pd.notna(row['cuisines']) else 'restaurant'
         segment = row['gtm_segment'] if pd.notna(row['gtm_segment']) else 'Unknown Segment'
@@ -47,41 +60,61 @@ def generate_messaging_and_context(selected_df):
         loc_count = int(row['total_nyc_locations']) if pd.notna(row['total_nyc_locations']) else 'multiple'
         global_locs = int(row['global_location_count']) if pd.notna(row['global_location_count']) else 'unknown'
         rating = row['avg_nyc_rating'] if pd.notna(row['avg_nyc_rating']) else 'highly-rated'
-        # Change the fallback from the awkward string to 'Unknown'
         pos = row['vendor_pos'] if pd.notna(row['vendor_pos']) and str(row['vendor_pos']).strip() != '' else 'Unknown'
         
+        # Inject human-in-the-loop rep notes if they exist
         rep_notes = row.get('rep_added_context', '')
         rep_notes_instruction = f"\nCRITICAL REP NOTES TO INTEGRATE: {rep_notes}" if str(rep_notes).strip() != '' else ""
         
-        # Update the prompt to conditionally handle the 'Unknown' POS state
+        price = row.get('price_tier', 'premium')
+        ig_url = row.get('instagram_url', '')
+        has_ig = "Yes" if str(ig_url).strip() != '' and str(ig_url) != 'nan' else "No"
+        
+        # 2. Prompt Architecture
         prompt = f"""
-        You are a GTM strategist generating targeted sales outreach data for 7shifts, a restaurant team management platform.
-        Target Company: {name}
+        You are a Go-To-Market strategist generating a targeted event invitation for 7shifts, a restaurant team management platform.
+        
+        TARGET COMPANY DATA:
+        Company: {name}
         GTM Segment: {segment}
         NYC Locations: {loc_count}
         Global Locations: {global_locs}
         POS System: {pos}
         Cuisine: {cuisine}
-        Average Rating: {rating}{rep_notes_instruction}
+        Average Rating: {rating}
+        Price Tier: {price}
+        Active on Instagram: {has_ig}{rep_notes_instruction}
         
-        SEGMENT DEFINITIONS & EXPECTED CONTEXT:
-        - NET_NEW_TARGET: Zero existing relationship. The sales context must highlight their total location count ({loc_count} NYC / {global_locs} Global). If the POS System is NOT 'Unknown', highlight their {pos} POS integration potential.
-        - EXPANSION_OPPORTUNITY: Current customer using us at a fraction of their total locations. The sales context must explicitly call out the whitespace (Total locations vs. currently deployed) as the primary revenue driver for the rep.
-        - CREDIBLE_PARTNER: Highly rated or influential brand. The sales context must focus on their brand influence ({rating} rating, {cuisine} concept) and why securing their logo elevates our market presence, even if the immediate location count is lower.
+        COPYWRITING RULES FOR THE INVITATION DRAFT:
+        1. THE PRIMARY OBJECTIVE: You must explicitly invite them to an exclusive, invite-only VIP Dinner and Summit for top NYC operators hosted by 7shifts next month.
+        2. Address exactly to: "Hi [Ops Director],"
+        3. Write the ACTUAL copy Alex (the Sales Rep) will send. Do not use placeholders other than [Ops Director].
+        4. Tone must be peer-to-peer, conversational B2B sales. Maximum 4 sentences.
+        5. Leverage the data provided to make the invite highly specific, but DO NOT list metrics like a robot. Use the data as the justification for why they are being invited.
+           - BAD: "Because you are a 4.5-star {cuisine} restaurant with {loc_count} locations, come to our event."
+           - GOOD: "Managing the operational complexity of {loc_count} {cuisine} locations in the city isn't easy, which is why we're bringing top operators together to talk shop."
+        
+        SEGMENT DIRECTIVES FOR THE INVITE:
+        - NET_NEW_TARGET: Frame the invite around their specific NYC footprint ({loc_count} locations). If POS is NOT 'Unknown', mention how other operators are leveraging {pos} integrations.
+        - EXPANSION_OPPORTUNITY: Casually acknowledge they are already a customer at a few locations, but frame the event around scaling operations across their entire {global_locs} location footprint.
+        - CREDIBLE_PARTNER: Frame the invite around their brand influence ({rating} rating, {cuisine} concept). Tell them we specifically want their perspective in the room.
+        
+        { 'CRITICAL: You MUST seamlessly integrate this rep note: ' + rep_notes if str(rep_notes).strip() != '' else 'End with a soft call to action asking if they are around for the dinner.' }
         
         Return a JSON object strictly matching this schema:
         {{
-            "invitation_draft": "A concise, 2-sentence professional invitation to an exclusive VIP dinner for restaurant executives in NYC hosted by 7shifts. Address exactly to [Ops Director]. Personalize the message by explicitly acknowledging their scale ({loc_count} NYC locations) and their {cuisine} concept. If the POS System is NOT 'Unknown', reference integrating with their {pos} system.{ ' CRITICAL: You MUST also seamlessly integrate this rep note into the invitation: ' + rep_notes if str(rep_notes).strip() != '' else '' } No subject lines or generic sign-offs.",
-            "sales_context": "A sharp, 1-2 sentence internal battle card for the Sales Rep (Alex). Explain exactly WHY this company is a high-value target using the segment definitions above. Cite their specific location footprint and segment. If the POS System is NOT 'Unknown', explicitly cite their POS data. If it is 'Unknown', do not mention POS systems at all."
+            "invitation_draft": "The conversational event invitation draft following the copywriting rules above.",
+            "sales_context": "A sharp, 1-2 sentence internal battle card for the Sales Rep (Alex). Explain exactly WHY this company is a high-value target based on their segment and data."
         }}
         """
         
+        # 3. Execution & Parsing
         try:
             response = client.models.generate_content(
                 model='gemini-2.5-flash',
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.4,
+                    temperature=0.4, # Low temperature forces adherence to instructions/schema
                     response_mime_type="application/json"
                 )
             )
@@ -89,6 +122,7 @@ def generate_messaging_and_context(selected_df):
             drafts.append(data.get("invitation_draft", "ERROR: Missing Key"))
             contexts.append(data.get("sales_context", "ERROR: Missing Key"))
         except Exception as e:
+            # Prevent single-record API failures from crashing the entire batch job
             drafts.append(f"ERROR: {e}")
             contexts.append(f"ERROR: {e}")
             
@@ -99,13 +133,18 @@ def generate_messaging_and_context(selected_df):
     return drafts, contexts
 
 def export_to_excel(final_df):
-    """Compiles the dataframe into Jamie's exact dual-sheet specification."""
+    """
+    Compiles the finalized dataframe into the specific dual-sheet Excel format 
+    required by Sales Leadership. Returns an in-memory byte stream.
+    """
     output = io.BytesIO()
     
+    # Isolate existing CRM customers from Net-New prospects based on CRM ID presence
     existing_mask = final_df['company_id'].notna() & (final_df['company_id'] != '')
     existing_df = final_df[existing_mask].copy()
     net_new_df = final_df[~existing_mask].copy()
     
+    # Map required columns for the Existing Customers sheet
     existing_export = pd.DataFrame({
         'company_id': existing_df['company_id'],
         'company_name': existing_df['crm_name'].fillna(existing_df['vendor_name']),
@@ -115,6 +154,7 @@ def export_to_excel(final_df):
         'invitation_draft': existing_df['invitation_draft']
     })
     
+    # Map required columns for the Net-New Prospects sheet
     net_new_export = pd.DataFrame({
         'company_name': net_new_df['vendor_name'],
         'website': net_new_df['vendor_website'],
@@ -123,6 +163,7 @@ def export_to_excel(final_df):
         'invitation_draft': net_new_df['invitation_draft']
     })
     
+    # Write to memory buffer
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         existing_export.to_excel(writer, sheet_name='Existing Customers', index=False)
         net_new_export.to_excel(writer, sheet_name='Net-New Prospects', index=False)
@@ -136,6 +177,9 @@ def main():
     if 'gtm_segment' in df.columns:
         df['gtm_segment'] = df['gtm_segment'].astype(str).str.upper().str.strip()
     
+    # --- State Management ---
+    # Streamlit re-runs top-to-bottom on every interaction. We must store the master 
+    # editable dataframe in session_state to persist user selections and generated drafts.
     if 'working_df' not in st.session_state:
         working_df = df.copy()
 
@@ -145,20 +189,21 @@ def main():
         else:
             working_df['Account_Name'] = working_df['vendor_name']
 
-        # --- ADDED: Vectorized UX Mapping ---
-        # Instantly categorizes records without iterating
+        # Vectorized mapping to flag Current Customers vs Prospects for easier UI filtering
         working_df['Account_Type'] = np.where(
             working_df['company_id'].notna() & (working_df['company_id'] != ''), 
             'Current Customer', 
             'Prospect'
         )
 
+        # Initialize interactive columns
         working_df['Select'] = False
         working_df['Approve'] = False
         working_df['invitation_draft'] = ""
         working_df['sales_context'] = ""
         working_df['rep_added_context'] = ""
         
+        # Enforce strict typing to prevent UI rendering errors
         working_df['Select'] = working_df['Select'].astype(bool)
         working_df['Approve'] = working_df['Approve'].astype(bool)
         working_df['invitation_draft'] = working_df['invitation_draft'].astype(str)
@@ -168,17 +213,21 @@ def main():
         working_df['total_nyc_locations'] = pd.to_numeric(working_df['total_nyc_locations'], errors='coerce').fillna(0)
         working_df['global_location_count'] = pd.to_numeric(working_df['global_location_count'], errors='coerce').fillna(0)
         
+        # Cast rating column for proper numerical sorting and formatting in the data editor
+        if 'avg_nyc_rating' in working_df.columns:
+            working_df['avg_nyc_rating'] = pd.to_numeric(working_df['avg_nyc_rating'], errors='coerce')
+        
         st.session_state.working_df = working_df
 
     # --- SIDEBAR: AUTO-SELECTION ENGINE ---
+    # Allows rapid programmatic selection based on desired pipeline ratios
     st.sidebar.header("🎯 Auto-Selection Engine")
     st.sidebar.markdown("Define your total audience size and segment breakdown.")
     
     max_val = max(1, len(df))
     total_target = st.sidebar.number_input("Total Invitees", min_value=1, max_value=max_val, value=30)
     
-    # --- ADDED: Garbage Collection Filter ---
-    # Removes PENDING_RESOLUTION and UNCLASSIFIED from the UI selections completely
+    # Garbage Collection Filter: Strip unresolved records from the GTM view entirely
     available_segments = sorted([seg for seg in df['gtm_segment'].dropna().unique().tolist() if seg not in ['PENDING_RESOLUTION', 'UNCLASSIFIED']])
     
     st.sidebar.subheader("Segment Breakdown (%)")
@@ -195,13 +244,26 @@ def main():
     if total_pct != 100:
         st.sidebar.warning(f"⚠️ Current allocation: **{total_pct}%**. Must equal 100%.")
     
+    # Auto-allocation logic: Sorts by NYC influence and grabs the top N targets per segment
     if st.sidebar.button("🤖 Auto-Select Top Targets", type="primary", disabled=(total_pct != 100)):
         st.session_state.working_df['Select'] = False
-        sorted_df = st.session_state.working_df.sort_values(
-            by=['total_nyc_locations', 'global_location_count'], 
-            ascending=[False, False]
-        )
         
+        # Ensure the EPI column exists and is typed correctly before sorting
+        if 'expansion_potential_index' in st.session_state.working_df.columns:
+            st.session_state.working_df['expansion_potential_index'] = pd.to_numeric(st.session_state.working_df['expansion_potential_index'], errors='coerce').fillna(0)
+            
+            # Sort by the new Expansion Potential Index first, using NYC footprint as a tie-breaker
+            sorted_df = st.session_state.working_df.sort_values(
+                by=['expansion_potential_index', 'total_nyc_locations'], 
+                ascending=[False, False]
+            )
+        else:
+            # Fallback for safety if the database hasn't been rebuilt yet
+            sorted_df = st.session_state.working_df.sort_values(
+                by=['location_whitespace', 'total_nyc_locations'], 
+                ascending=[False, False]
+            )
+            
         for seg, pct in allocations.items():
             if pct > 0:
                 count = int(round((pct / 100.0) * total_target))
@@ -213,7 +275,7 @@ def main():
     # --- STEP 1: AUDIENCE SHORTLISTING ---
     st.header("Step 1: Build Shortlist")
     
-    # --- ADDED: UX Filter for Account Type ---
+    # High-level filters
     col_filter1, col_filter2 = st.columns([1, 3])
     with col_filter1:
         account_filter = st.selectbox("View by Account Type:", ["All", "Current Customer", "Prospect"])
@@ -224,7 +286,6 @@ def main():
         
     filtered_mask = st.session_state.working_df['gtm_segment'].isin(active_segments)
     
-    # Apply the UX Account Type filter on top of the segment mask
     if account_filter != "All":
         filtered_mask = filtered_mask & (st.session_state.working_df['Account_Type'] == account_filter)
         
@@ -233,18 +294,33 @@ def main():
         ascending=[False, False]
     )
     
-    # --- ADDED: Account_Type into the Display Columns ---
-    display_cols = ['Select', 'Account_Name', 'Account_Type', 'gtm_segment', 'total_nyc_locations', 'cuisines']
+    # Define columns to expose in the interactive grid
+    # Define columns to expose in the interactive grid
+    display_cols = ['Select', 'Account_Name', 'Account_Type', 'gtm_segment', 'expansion_potential_index', 'total_nyc_locations', 'avg_nyc_rating']
     display_cols = [col for col in display_cols if col in filtered_df.columns]
     
+    # Bi-directional dataframe editor. Binds user checkbox clicks back to the session state.
     edited_selection = st.data_editor(
         filtered_df[display_cols],
         hide_index=True,
         key="audience_editor",
         width="stretch",
-        disabled=[col for col in display_cols if col != 'Select']
+        column_config={
+            "avg_nyc_rating": st.column_config.NumberColumn(
+                "Avg Rating",
+                help="Average Google Review Rating for NYC Locations",
+                format="%.1f ⭐",
+            ),
+            "expansion_potential_index": st.column_config.NumberColumn(
+                "Expansion Score",
+                help="Predictive revenue proxy based on whitespace and plan tier upgrades.",
+                format="%.1fx"
+            )
+        },
+        disabled=[col for col in display_cols if col != 'Select'] # Lock all columns except 'Select'
     )
     
+    # Sync visual edits back to the master working_df
     if st.session_state.get("audience_editor"):
         for row_idx, edit_values in st.session_state.audience_editor["edited_rows"].items():
             actual_df_idx = filtered_df.index[int(row_idx)]
@@ -257,6 +333,7 @@ def main():
     # --- STEP 2: BASELINE GENERATION ---
     st.header("Step 2: Generate Baseline Context & Messaging")
     
+    # Triggers the batch LLM generation for all records where 'Select' == True
     if st.button("Generate Baseline for Selected", type="primary") and selected_count > 0:
         target_mask = st.session_state.working_df['Select'] == True
         targets = st.session_state.working_df[target_mask]
@@ -267,6 +344,7 @@ def main():
         st.rerun()
 
     # --- STEP 3: REP REVIEW & HYPER-PERSONALIZATION ---
+    # Only displays records that have successfully generated context
     review_mask = (st.session_state.working_df['Select'] == True) & (st.session_state.working_df['sales_context'] != "")
     review_df = st.session_state.working_df[review_mask]
     
@@ -277,6 +355,7 @@ def main():
         review_cols = ['Approve', 'vendor_name', 'sales_context', 'rep_added_context', 'invitation_draft']
         review_cols = [col for col in review_cols if col in review_df.columns]
         
+        # Second interactive grid dedicated purely to copy review and feedback injection
         edited_review = st.data_editor(
             review_df[review_cols],
             hide_index=True,
@@ -290,6 +369,7 @@ def main():
             disabled=[col for col in review_cols if col not in ['Approve', 'rep_added_context', 'invitation_draft']]
         )
         
+        # Sync copy edits and rep notes back to master state
         if st.session_state.get("review_editor"):
             for row_idx, edit_values in st.session_state.review_editor["edited_rows"].items():
                 actual_df_idx = review_df.index[int(row_idx)]
@@ -302,6 +382,7 @@ def main():
 
         col1, col2 = st.columns([1, 4])
         with col1:
+            # Re-triggers the LLM *only* for records where the human Rep has added a custom note
             if st.button("🔄 Regenerate Edited Drafts"):
                 regen_mask = (st.session_state.working_df['Select'] == True) & (st.session_state.working_df['rep_added_context'].str.strip() != "")
                 regen_targets = st.session_state.working_df[regen_mask]
@@ -315,6 +396,7 @@ def main():
         approved_count = st.session_state.working_df.loc[review_df.index, 'Approve'].sum()
         
         # --- STEP 4: EXPORT ---
+        # Exposes the download button only once targets are explicitly approved
         if approved_count > 0:
             st.success(f"{approved_count} records approved and ready for target activation export.")
             

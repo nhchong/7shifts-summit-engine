@@ -1,0 +1,20 @@
+version: 2
+
+models:
+  - name: fct_vendor_signals
+    description: >
+      Master entity resolution table combining Salesforce CRM accounts with scraped vendor data.
+      Calculates dynamic market percentiles to output a strict GTM segmentation matrix.
+    columns:
+      - name: gtm_segment
+        description: >
+          The prioritized sales motion classification. 
+          - **PENDING_RESOLUTION**: Unmatched CRM record requiring AI string-matching.
+          - **EXPANSION_OPPORTUNITY**: Existing customer with >1 un-deployed location.
+          - **NET_NEW_TARGET**: Non-customer in the top 50% of the market influence score.
+          - **CREDIBLE_PARTNER**: Existing customer, fully deployed, top 20% influence score.
+          - **UNCLASSIFIED**: Bottom tier prospects; filter out of UI.
+        tests:
+          - not_null
+      - name: location_whitespace
+        description: Delta between the vendor's total global footprint and the number of locations currently deployed in the CRM.

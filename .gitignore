@@ -4,6 +4,7 @@
 venv/
 dbt_env/
 .env
+.streamlit/secrets.toml
 
 # ========================
 # Python Artifacts
@@ -12,13 +13,14 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+scripts/test.py
 
 # ========================
 # Data & Outputs
 # ========================
+*.db
 *.sqlite
 *.sqlite3
-data/*.csv
 data/*.xlsx
 outputs/
 fct_master_dataset_dump.csv
