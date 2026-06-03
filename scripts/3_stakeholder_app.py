@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 # --- Initialization ---
 st.set_page_config(page_title="7shifts Summit Selector", layout="wide")
 load_dotenv()
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 @st.cache_data
 def load_data():
@@ -35,14 +36,15 @@ def load_data():
     
     # Cast to string and normalize to safely catch varied boolean/string database representations
     df['is_franchise_str'] = df['is_franchise'].astype(str).str.strip().str.upper()
-    return df[df['is_franchise_str'].isin(['0', '0.0', 'FALSE', 'UNKNOWN'])]
+    filtered = df[df['is_franchise_str'].isin(['0', '0.0', 'FALSE', 'UNKNOWN'])].copy()
+    filtered.drop(columns=['is_franchise_str'], inplace=True)
+    return filtered
 
 def generate_messaging_and_context(selected_df):
     """
     Orchestrates few-shot LLM inference to generate hyper-personalized sales drafts.
     Enforces a strict JSON schema return to ensure predictable parsing into the dataframe.
     """
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
     drafts = []
     contexts = []
     
@@ -304,7 +306,7 @@ def main():
         filtered_df[display_cols],
         hide_index=True,
         key="audience_editor",
-        width="stretch",
+        use_container_width=True,
         column_config={
             "avg_nyc_rating": st.column_config.NumberColumn(
                 "Avg Rating",
@@ -360,7 +362,7 @@ def main():
             review_df[review_cols],
             hide_index=True,
             key="review_editor",
-            width="stretch",
+            use_container_width=True,
             column_config={
                 "sales_context": st.column_config.TextColumn("Sales Context (Why?)", width="medium"),
                 "rep_added_context": st.column_config.TextColumn("Rep Added Context", width="medium"),

@@ -16,6 +16,11 @@ __pycache__/
 scripts/test.py
 
 # ========================
+# Sensitive Docs
+# ========================
+case-study-brief.md
+
+# ========================
 # Data & Outputs
 # ========================
 *.db

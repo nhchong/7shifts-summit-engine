@@ -57,51 +57,43 @@ def run_signal_engineering():
     
     # 4. Asynchronous Network Execution (Synchronous wrapper for local execution)
     with sync_playwright() as p:
-        # Launch Chromium. Context isolates cookies and sets a normalized user-agent.
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080}
-        )
-        page = context.new_page()
-        
+
         for idx in high_risk_indices:
             vendor_name = df.at[idx, 'vendor_name']
             raw_url = df.at[idx, 'vendor_website']
-            
-            # Normalize schema for the browser
+
             target_url = raw_url if raw_url.startswith(('http://', 'https://')) else f"https://{raw_url}"
             logging.info(f"Checking {vendor_name} ({target_url})...")
-            
+
+            # Fresh context and page per vendor — prevents cookie/state bleed between sites.
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080}
+            )
+            page = context.new_page()
+
             try:
-                # WAF BYPASS: Injects stealth scripts to mask WebDriver properties, 
-                # preventing automatic blocks from Cloudflare/Akamai.
                 stealth_sync(page)
-                
-                # PERFORMANCE: 'domcontentloaded' avoids infinite hangs caused by 
-                # broken 3rd-party tracking pixels waiting for 'networkidle'.
                 response = page.goto(target_url, timeout=20000, wait_until='domcontentloaded')
-                
+
                 if response is None:
                     df.at[idx, 'scrape_status'] = 'FAILED_NO_RESPONSE'
                     df.at[idx, 'is_franchise'] = 'UNKNOWN'
                     logging.warning(f" -> UNKNOWN: {vendor_name} (No response from server)")
                     continue
-                    
+
                 status = response.status
                 df.at[idx, 'scrape_status'] = str(status)
-                
+
                 if status >= 400:
                     df.at[idx, 'is_franchise'] = 'UNKNOWN'
                     logging.warning(f" -> UNKNOWN: {vendor_name} (HTTP {status})")
                     continue
-                    
-                # Hydration Extraction: Pulls the physical text actually rendered to the user
+
                 body_text = page.inner_text('body')
-                
-                # Business Logic: Evaluate the payload
                 match = FRANCHISE_PATTERN.search(body_text)
-                
+
                 if match:
                     df.at[idx, 'is_franchise'] = True
                     df.at[idx, 'franchise_evidence'] = match.group(0)
@@ -109,25 +101,26 @@ def run_signal_engineering():
                 else:
                     df.at[idx, 'is_franchise'] = False
                     logging.info(f" -> PASS: {vendor_name} verified as independent.")
-                    
+
             except PlaywrightTimeoutError:
-                # Graceful Failure: Assign 'UNKNOWN' rather than dropping the record
                 df.at[idx, 'scrape_status'] = 'TIMEOUT'
                 df.at[idx, 'is_franchise'] = 'UNKNOWN'
                 logging.warning(f" -> UNKNOWN: {vendor_name} (Timeout - Site too slow or blocked bot)")
             except Exception as e:
-                # Network Layer Drops: Extract the Chromium net::ERR code (e.g., DNS resolution failure)
-                error_msg = str(e).split('\n')[0] 
+                error_msg = str(e).split('\n')[0]
                 df.at[idx, 'scrape_status'] = f"ERROR: {error_msg}"
                 df.at[idx, 'is_franchise'] = 'UNKNOWN'
                 logging.warning(f" -> UNKNOWN: {vendor_name} (Error: {error_msg})")
-        
+            finally:
+                context.close()
+
         browser.close()
-    
+
     # 5. Pipeline Terminal Persistence
-    # Atomic transaction to provision the final materialized view for the Streamlit UI.
-    df.to_sql('fct_activation_ready', conn, if_exists='replace', index=False)
-    conn.close()
+    try:
+        df.to_sql('fct_activation_ready', conn, if_exists='replace', index=False)
+    finally:
+        conn.close()
     
     logging.info(f"Phase 2 Complete. {len(df)} records safely persisted to 'fct_activation_ready'.")
 

@@ -5,3 +5,5 @@ sources:
       - name: companies
       - name: locations
       - name: crm_accounts
+      - name: entity_resolution_map
+      - name: duplicate_vendor_ids

@@ -4,7 +4,7 @@ WITH crm AS (
     SELECT 
         company_id,
         company_name,
-        LOWER(REPLACE(REPLACE(domain, 'www.', ''), 'https://', '')) AS clean_domain,
+        LOWER(REPLACE(REPLACE(REPLACE(domain, 'https://', ''), 'http://', ''), 'www.', '')) AS clean_domain,
         plan_name AS crm_plan,
         locations_in_7shifts AS crm_location_count
     FROM {{ ref('stg_crm_accounts') }}
@@ -32,7 +32,7 @@ vendor_signals_agg AS (
         c.account_id AS vendor_id,
         c.company_name AS vendor_name,
         c.website AS vendor_website,
-        LOWER(REPLACE(REPLACE(c.website, 'www.', ''), 'https://', '')) AS clean_domain,
+        LOWER(REPLACE(REPLACE(REPLACE(c.website, 'https://', ''), 'http://', ''), 'www.', '')) AS clean_domain,
         COUNT(location_id) AS global_location_count,
         c.pos_vendor AS vendor_pos,
         COUNT(DISTINCT CASE WHEN l.city IN ('New York', 'Brooklyn', 'Queens', 'Bronx', 'Staten Island', 'Flushing', 'Astoria', 'Long Island City', 'Jackson Heights') THEN l.google_place_id ELSE NULL END) AS total_nyc_locations,
