@@ -34,8 +34,18 @@ resolved AS (
         COALESCE(d.vendor_pos, v.vendor_pos)                                   AS vendor_pos,
         COALESCE(d.cuisines, v.cuisines)                                       AS cuisines,
         COALESCE(d.price_tier, v.price_tier)                                   AS price_tier,
-        COALESCE(d.market_footprint_percentile, v.market_footprint_percentile) AS market_footprint_percentile,
-        COALESCE(d.market_rating_percentile, v.market_rating_percentile)       AS market_rating_percentile
+        -- For entity-resolved records, the CRM row carries a 0.0 percentile (not NULL)
+        -- because PERCENT_RANK on a null-location row returns 0, not NULL.
+        -- COALESCE(0.0, vendor_value) would silently keep the wrong 0.0, so we
+        -- explicitly prefer the vendor's percentile whenever this row was resolved.
+        CASE WHEN d.vendor_id IS NULL AND r.matched_vendor_id IS NOT NULL
+             THEN v.market_footprint_percentile
+             ELSE d.market_footprint_percentile
+        END AS market_footprint_percentile,
+        CASE WHEN d.vendor_id IS NULL AND r.matched_vendor_id IS NOT NULL
+             THEN v.market_rating_percentile
+             ELSE d.market_rating_percentile
+        END AS market_rating_percentile
     FROM deduped d
     LEFT JOIN resolution_map r ON d.company_id = r.company_id
     LEFT JOIN vendor_signals v  ON r.matched_vendor_id = v.vendor_id
@@ -74,6 +84,7 @@ expansion_scoring AS (
 final_segments AS (
     SELECT
         *,
+        (market_footprint_percentile + market_rating_percentile) / 2.0 AS composite_influence_score,
         CASE
             -- Quality gate: no NYC presence means no relevance to this market, regardless of event type
             WHEN total_nyc_locations = 0

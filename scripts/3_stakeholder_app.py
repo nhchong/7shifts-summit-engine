@@ -19,7 +19,7 @@ from google.genai import types
 from dotenv import load_dotenv
 
 # --- Initialization ---
-st.set_page_config(page_title="7shifts Summit Selector", layout="wide")
+st.set_page_config(page_title="7shifts | Audience Builder", layout="wide")
 load_dotenv()
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
@@ -202,8 +202,7 @@ def export_to_excel(final_df):
     return output.getvalue()
 
 def main():
-    st.title("🍽️ NYC Summit — Audience Selector")
-    st.caption("Select, score, and activate your summit invite list. Generate personalised outreach drafts and export for Salesforce.")
+    st.title("Audience Selector")
 
     df = load_data()
 
@@ -266,43 +265,27 @@ def main():
         st.session_state.working_df = working_df
 
     # --- SIDEBAR: AI AUDIENCE BUILDER ---
-    available_segments = sorted([
-        seg for seg in df['gtm_segment'].dropna().unique().tolist()
-        if seg not in ['PENDING_RESOLUTION', 'UNCLASSIFIED']
-    ])
+    _seg_order = ['EXPANSION_PARTNER', 'EXPANSION_OPPORTUNITY', 'CREDIBLE_PARTNER', 'NET_NEW_TARGET']
+    _existing_segs = df['gtm_segment'].dropna().unique().tolist()
+    available_segments = [s for s in _seg_order if s in _existing_segs]
+
     seg_counts_sidebar = df[df['gtm_segment'].isin(available_segments)]['gtm_segment'].value_counts().to_dict()
 
     n_prospects  = seg_counts_sidebar.get('NET_NEW_TARGET', 0)
     n_existing   = sum(seg_counts_sidebar.get(s, 0) for s in ['EXPANSION_OPPORTUNITY', 'EXPANSION_PARTNER', 'CREDIBLE_PARTNER'])
 
     st.sidebar.header("Build Your Audience")
-    st.sidebar.caption(
-        f"Working with **{n_prospects + n_existing} targets** — "
-        f"{n_prospects} prospects · {n_existing} existing customers. "
-        f"Describe what you need and the system will build the list."
-    )
+    st.sidebar.caption(f"{n_prospects + n_existing} targets · {n_prospects} prospects · {n_existing} existing customers")
 
-    examples = [
-        "30 invites — balanced mix of new prospects and existing customers",
-        "Credibility-first: prioritise our strongest existing customers in the room",
-        "Pure pipeline — high-influence restaurant groups we haven't won yet",
-        "Focus on existing customers with the most room to grow or upgrade",
-    ]
-    st.sidebar.write("**Try an example:**")
-    for ex in examples:
-        if st.sidebar.button(ex, use_container_width=True):
-            st.session_state.audience_prompt_input = ex
-            st.rerun()
-
-    st.sidebar.write("")
     audience_prompt = st.sidebar.text_area(
-        "Or describe your goal:",
-        placeholder="e.g. '25 invites — weight toward multi-location prospects with high ratings'",
+        label="audience_prompt",
+        placeholder='e.g. "30 invites, mix of new prospects and existing customers"',
         height=100,
-        key="audience_prompt_input"
+        key="audience_prompt_input",
+        label_visibility="collapsed"
     )
 
-    if st.sidebar.button("✨ Build My List", type="primary", disabled=not (audience_prompt or "").strip()):
+    if st.sidebar.button("Build My List", type="primary", use_container_width=True, disabled=not (audience_prompt or "").strip()):
         with st.spinner("Building your audience..."):
             config = interpret_audience_prompt(audience_prompt, available_segments, seg_counts_sidebar)
             st.session_state.ai_config = config
@@ -344,7 +327,7 @@ def main():
         st.sidebar.caption("\n\n".join(lines))
 
     # --- STEP 1: AUDIENCE SHORTLISTING ---
-    st.header("Step 1: Build Your Shortlist")
+    st.header("Your Shortlist")
 
     segment_filter = st.multiselect(
         "Filter by Segment",
@@ -421,8 +404,7 @@ def main():
     st.divider()
 
     # --- STEP 2: BASELINE GENERATION ---
-    st.header("Step 2: Generate Drafts")
-    st.caption("Generates a personalised invitation draft and internal sales context for each selected account.")
+    st.header("Outreach Drafts")
 
     if st.button("Generate Baseline for Selected", type="primary", disabled=(selected_count == 0)):
         target_mask = st.session_state.working_df['Select'] == True
@@ -438,8 +420,7 @@ def main():
 
     if not review_df.empty:
         st.divider()
-        st.header("Step 3: Review & Personalise")
-        st.caption("Add a note in **Rep Context** to trigger a hyper-personalised regeneration for that account.")
+        st.header("Review & Personalise")
 
         review_cols = ['Approve', 'Account_Name', 'Segment_Label', 'sales_context', 'rep_added_context', 'invitation_draft']
         review_cols = [col for col in review_cols if col in review_df.columns]
