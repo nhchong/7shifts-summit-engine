@@ -27,6 +27,7 @@ SEGMENT_LABELS = {
     'NET_NEW_TARGET':        '🎯 Net New Target',
     'EXPANSION_OPPORTUNITY': '📈 Expansion Opportunity',
     'CREDIBLE_PARTNER':      '⭐ Credible Partner',
+    'EXPANSION_PARTNER':     '🏆 Expansion Partner',
     'PENDING_RESOLUTION':    '⏳ Pending Resolution',
     'UNCLASSIFIED':          'Unclassified',
 }
@@ -125,6 +126,51 @@ def generate_messaging_and_context(selected_df):
     status_text.text("Generation complete.")
     return drafts, contexts
 
+def interpret_audience_prompt(prompt, available_segments, seg_counts):
+    context = "\n".join([
+        f"- {SEGMENT_LABELS.get(s, s)}: {seg_counts.get(s, 0)} records available"
+        for s in available_segments
+    ])
+    instruction = f"""You configure an audience selection engine for a 7shifts NYC restaurant summit.
+
+Segment definitions:
+- EXPANSION_PARTNER: Fully deployed 7shifts customer with plan upgrade potential — highest value, both credible and growable.
+- CREDIBLE_PARTNER: Fully deployed 7shifts customer with strong brand presence — adds room credibility.
+- EXPANSION_OPPORTUNITY: Existing customer with location or plan growth whitespace — upsell pipeline.
+- NET_NEW_TARGET: High-influence prospect not yet on 7shifts — acquisition pipeline.
+
+Available segments and record counts:
+{context}
+
+User goal: "{prompt}"
+
+Return JSON matching this schema exactly:
+{{
+  "total_target": <integer, default 30 unless user specifies>,
+  "allocations": {{{", ".join(f'"{s}": <int 0-100>' for s in available_segments)}}},
+  "weights": {{"footprint": <int 0-10>, "rating": <int 0-10>, "expansion": <int 0-10>}},
+  "reasoning": "<one sentence explaining what this configuration optimises for>"
+}}
+
+Rules: allocation values must sum to exactly 100. Only allocate >0 to segments with records available.
+"""
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=instruction,
+        config=types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json")
+    )
+    data = json.loads(response.text)
+    alloc = data.get('allocations', {})
+    total = sum(alloc.values()) or 1
+    if total != 100:
+        alloc = {k: round(v * 100 / total) for k, v in alloc.items()}
+        diff = 100 - sum(alloc.values())
+        if diff and alloc:
+            alloc[max(alloc, key=alloc.get)] += diff
+        data['allocations'] = alloc
+    return data
+
+
 def export_to_excel(final_df):
     output = io.BytesIO()
 
@@ -165,14 +211,20 @@ def main():
         df['gtm_segment'] = df['gtm_segment'].astype(str).str.upper().str.strip()
 
     # --- PIPELINE OVERVIEW METRICS ---
-    active_df = df[df['gtm_segment'].isin(['NET_NEW_TARGET', 'EXPANSION_OPPORTUNITY', 'CREDIBLE_PARTNER'])]
+    active_df = df[df['gtm_segment'].isin(['NET_NEW_TARGET', 'EXPANSION_OPPORTUNITY', 'CREDIBLE_PARTNER', 'EXPANSION_PARTNER'])]
     seg_counts = active_df['gtm_segment'].value_counts()
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Pipeline", len(active_df))
-    m2.metric("🎯 Net New Targets", seg_counts.get('NET_NEW_TARGET', 0))
-    m3.metric("📈 Expansion Opportunities", seg_counts.get('EXPANSION_OPPORTUNITY', 0))
-    m4.metric("⭐ Credible Partners", seg_counts.get('CREDIBLE_PARTNER', 0))
+    seg_metric_labels = {
+        'NET_NEW_TARGET':        '🎯 Net New Targets',
+        'EXPANSION_OPPORTUNITY': '📈 Expansion Opportunities',
+        'CREDIBLE_PARTNER':      '⭐ Credible Partners',
+        'EXPANSION_PARTNER':     '🏆 Expansion Partners',
+    }
+    nonempty_segs = [s for s in seg_metric_labels if seg_counts.get(s, 0) > 0]
+    metric_cols = st.columns(1 + len(nonempty_segs))
+    metric_cols[0].metric("Total Pipeline", len(active_df))
+    for col, seg in zip(metric_cols[1:], nonempty_segs):
+        col.metric(seg_metric_labels[seg], seg_counts[seg])
 
     st.divider()
 
@@ -213,80 +265,117 @@ def main():
 
         st.session_state.working_df = working_df
 
-    # --- SIDEBAR: AUTO-SELECTION ENGINE ---
-    st.sidebar.header("🎯 Auto-Selection Engine")
-    st.sidebar.caption("Define your audience size and segment mix, then auto-select the top-ranked targets.")
-
-    max_val = max(1, len(df))
-    total_target = st.sidebar.number_input("Total Invitees", min_value=1, max_value=max_val, value=30)
-
+    # --- SIDEBAR: AI AUDIENCE BUILDER ---
     available_segments = sorted([
         seg for seg in df['gtm_segment'].dropna().unique().tolist()
         if seg not in ['PENDING_RESOLUTION', 'UNCLASSIFIED']
     ])
+    seg_counts_sidebar = df[df['gtm_segment'].isin(available_segments)]['gtm_segment'].value_counts().to_dict()
 
-    st.sidebar.subheader("Segment Breakdown (%)")
-    allocations = {}
-    default_vals = {'CREDIBLE_PARTNER': 10, 'EXPANSION_OPPORTUNITY': 40, 'NET_NEW_TARGET': 50}
+    n_prospects  = seg_counts_sidebar.get('NET_NEW_TARGET', 0)
+    n_existing   = sum(seg_counts_sidebar.get(s, 0) for s in ['EXPANSION_OPPORTUNITY', 'EXPANSION_PARTNER', 'CREDIBLE_PARTNER'])
 
-    for seg in available_segments:
-        label = SEGMENT_LABELS.get(seg, seg)
-        allocations[seg] = st.sidebar.number_input(label, min_value=0, max_value=100, value=default_vals.get(seg, 0), step=5)
+    st.sidebar.header("Build Your Audience")
+    st.sidebar.caption(
+        f"Working with **{n_prospects + n_existing} targets** — "
+        f"{n_prospects} prospects · {n_existing} existing customers. "
+        f"Describe what you need and the system will build the list."
+    )
 
-    total_pct = sum(allocations.values())
+    examples = [
+        "30 invites — balanced mix of new prospects and existing customers",
+        "Credibility-first: prioritise our strongest existing customers in the room",
+        "Pure pipeline — high-influence restaurant groups we haven't won yet",
+        "Focus on existing customers with the most room to grow or upgrade",
+    ]
+    st.sidebar.write("**Try an example:**")
+    for ex in examples:
+        if st.sidebar.button(ex, use_container_width=True):
+            st.session_state.audience_prompt_input = ex
+            st.rerun()
 
-    if total_pct != 100:
-        st.sidebar.warning(f"⚠️ Allocation is **{total_pct}%** — must equal 100%.")
+    st.sidebar.write("")
+    audience_prompt = st.sidebar.text_area(
+        "Or describe your goal:",
+        placeholder="e.g. '25 invites — weight toward multi-location prospects with high ratings'",
+        height=100,
+        key="audience_prompt_input"
+    )
 
-    if st.sidebar.button("Auto-Select Top Targets", type="primary", disabled=(total_pct != 100)):
-        st.session_state.working_df['Select'] = False
+    if st.sidebar.button("✨ Build My List", type="primary", disabled=not (audience_prompt or "").strip()):
+        with st.spinner("Building your audience..."):
+            config = interpret_audience_prompt(audience_prompt, available_segments, seg_counts_sidebar)
+            st.session_state.ai_config = config
 
-        if 'expansion_potential_index' in st.session_state.working_df.columns:
-            st.session_state.working_df['expansion_potential_index'] = pd.to_numeric(
-                st.session_state.working_df['expansion_potential_index'], errors='coerce'
-            ).fillna(0)
-            sorted_df = st.session_state.working_df.sort_values(
-                by=['expansion_potential_index', 'total_nyc_locations'],
-                ascending=[False, False]
+            wdf = st.session_state.working_df
+            wdf['expansion_potential_index'] = pd.to_numeric(wdf['expansion_potential_index'], errors='coerce').fillna(0)
+            st.session_state.working_df['Select'] = False
+
+            w = config.get('weights', {})
+            w_f = w.get('footprint', 5)
+            w_r = w.get('rating', 5)
+            w_e = w.get('expansion', 5)
+            total_w = (w_f + w_r + w_e) or 1
+            epi_max = wdf['expansion_potential_index'].clip(lower=0).max() or 1
+            priority = (
+                (w_f / total_w) * wdf['market_footprint_percentile'].fillna(0) +
+                (w_r / total_w) * wdf['market_rating_percentile'].fillna(0) +
+                (w_e / total_w) * (wdf['expansion_potential_index'].clip(lower=0) / epi_max)
             )
-        else:
-            sorted_df = st.session_state.working_df.sort_values(
-                by=['location_whitespace', 'total_nyc_locations'],
-                ascending=[False, False]
-            )
+            sorted_df = wdf.assign(priority_score=priority).sort_values('priority_score', ascending=False)
 
-        for seg, pct in allocations.items():
-            if pct > 0:
-                count = int(round((pct / 100.0) * total_target))
-                seg_indices = sorted_df[sorted_df['gtm_segment'] == seg].head(count).index
-                st.session_state.working_df.loc[seg_indices, 'Select'] = True
+            total_target = config.get('total_target', 30)
+            for seg, pct in config.get('allocations', {}).items():
+                if pct > 0:
+                    count = int(round((pct / 100.0) * total_target))
+                    idx = sorted_df[sorted_df['gtm_segment'] == seg].head(count).index
+                    st.session_state.working_df.loc[idx, 'Select'] = True
         st.rerun()
+
+    if 'ai_config' in st.session_state:
+        cfg = st.session_state.ai_config
+        st.sidebar.success(cfg.get('reasoning', ''))
+        total_target = cfg.get('total_target', 30)
+        lines = [f"**{total_target} invites**"]
+        for seg, pct in sorted(cfg.get('allocations', {}).items(), key=lambda x: -x[1]):
+            if pct > 0:
+                count = int(round(pct / 100 * total_target))
+                lines.append(f"• {SEGMENT_LABELS.get(seg, seg)}: {count}")
+        st.sidebar.caption("\n\n".join(lines))
 
     # --- STEP 1: AUDIENCE SHORTLISTING ---
     st.header("Step 1: Build Your Shortlist")
 
-    col_filter1, col_filter2 = st.columns([1, 2])
-    with col_filter1:
-        account_filter = st.selectbox("Account Type", ["All", "Current Customer", "Prospect"])
-    with col_filter2:
-        segment_filter = st.multiselect(
-            "Segment",
-            options=available_segments,
-            default=available_segments,
-            format_func=lambda x: SEGMENT_LABELS.get(x, x)
-        )
+    segment_filter = st.multiselect(
+        "Filter by Segment",
+        options=available_segments,
+        default=available_segments,
+        format_func=lambda x: SEGMENT_LABELS.get(x, x)
+    )
+
+    # Recompute priority_score using weights from last AI run, or equal defaults
+    _w = st.session_state.get('ai_config', {}).get('weights', {})
+    _w_f = _w.get('footprint', 5)
+    _w_r = _w.get('rating', 5)
+    _w_e = _w.get('expansion', 5)
+    _wdf = st.session_state.working_df
+    _total_w = (_w_f + _w_r + _w_e) or 1
+    _epi_max = _wdf['expansion_potential_index'].clip(lower=0).max() or 1
+    st.session_state.working_df['priority_score'] = (
+        (_w_f / _total_w) * _wdf['market_footprint_percentile'].fillna(0) +
+        (_w_r / _total_w) * _wdf['market_rating_percentile'].fillna(0) +
+        (_w_e / _total_w) * (_wdf['expansion_potential_index'].clip(lower=0) / _epi_max)
+    )
 
     active_segments = segment_filter if segment_filter else available_segments
     filtered_mask = st.session_state.working_df['gtm_segment'].isin(active_segments)
-    if account_filter != "All":
-        filtered_mask = filtered_mask & (st.session_state.working_df['Account_Type'] == account_filter)
 
     filtered_df = st.session_state.working_df[filtered_mask].sort_values(
-        by=['Select', 'total_nyc_locations'],
+        by=['Select', 'priority_score'],
         ascending=[False, False]
     )
 
-    display_cols = ['Select', 'Account_Name', 'Account_Type', 'Segment_Label', 'expansion_potential_index', 'total_nyc_locations', 'avg_nyc_rating']
+    display_cols = ['Select', 'Account_Name', 'Segment_Label', 'priority_score', 'expansion_potential_index', 'total_nyc_locations', 'avg_nyc_rating']
     display_cols = [col for col in display_cols if col in filtered_df.columns]
 
     edited_selection = st.data_editor(
@@ -297,8 +386,14 @@ def main():
         column_config={
             "Select": st.column_config.CheckboxColumn("Select", width="small"),
             "Account_Name": st.column_config.TextColumn("Account", width="large"),
-            "Account_Type": st.column_config.TextColumn("Type", width="small"),
             "Segment_Label": st.column_config.TextColumn("Segment", width="medium"),
+            "priority_score": st.column_config.ProgressColumn(
+                "Priority Score",
+                help="Weighted composite of footprint, brand quality, and expansion potential. Adjust signal weights in the sidebar.",
+                min_value=0,
+                max_value=1,
+                format="%.2f",
+            ),
             "expansion_potential_index": st.column_config.NumberColumn(
                 "Expansion Score",
                 help="Predictive revenue proxy based on location whitespace and plan upgrade delta.",

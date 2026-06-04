@@ -4,9 +4,9 @@ set -e
 # Step 0: Wipe existing DB tables and ingest raw Excel data
 python scripts/0_ingest_excel_to_db.py
 
-# Step 1: Build base layers and initial segmentation matrix
+# Step 1: Build base layers and initial segmentation matrix (fct_master_dataset excluded — depends on entity resolution outputs from Step 2)
 cd seven_shifts_project
-dbt run
+dbt run --select +fct_vendor_signals
 cd ..
 
 # Step 2: Resolve orphaned CRM records using RapidFuzz and Gemini AI

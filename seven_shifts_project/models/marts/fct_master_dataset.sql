@@ -74,20 +74,27 @@ expansion_scoring AS (
 final_segments AS (
     SELECT
         *,
-        (market_footprint_percentile + market_rating_percentile) / 2.0 AS composite_influence_score,
         CASE
+            -- Quality gate: no NYC presence means no relevance to this market, regardless of event type
+            WHEN total_nyc_locations = 0
+                THEN 'UNCLASSIFIED'
             WHEN company_id IS NOT NULL AND vendor_id IS NULL
                 THEN 'PENDING_RESOLUTION'
+            -- Top tier: fully deployed + plan upgrade potential
+            WHEN company_id IS NOT NULL AND vendor_id IS NOT NULL
+                 AND location_whitespace <= 0
+                 AND expansion_potential_index > 0
+                THEN 'EXPANSION_PARTNER'
+            -- Fully deployed existing customer, no expansion lever
+            WHEN company_id IS NOT NULL AND vendor_id IS NOT NULL
+                 AND location_whitespace <= 0
+                THEN 'CREDIBLE_PARTNER'
             WHEN company_id IS NOT NULL AND vendor_id IS NOT NULL
                  AND expansion_potential_index > 0
                 THEN 'EXPANSION_OPPORTUNITY'
+            -- All remaining prospects with NYC presence — score-based ranking happens at the UI layer
             WHEN company_id IS NULL AND vendor_id IS NOT NULL
-                 AND (market_footprint_percentile + market_rating_percentile) / 2.0 >= 0.5
                 THEN 'NET_NEW_TARGET'
-            WHEN company_id IS NOT NULL AND vendor_id IS NOT NULL
-                 AND location_whitespace <= 0
-                 AND (market_footprint_percentile + market_rating_percentile) / 2.0 >= 0.8
-                THEN 'CREDIBLE_PARTNER'
             ELSE 'UNCLASSIFIED'
         END AS gtm_segment
     FROM expansion_scoring

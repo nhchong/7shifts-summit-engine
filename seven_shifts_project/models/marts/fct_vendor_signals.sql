@@ -95,40 +95,12 @@ base_metrics AS (
     FROM master_join
 ),
 
--- Calculate the final Expansion Potential Index (EPI)
-expansion_scoring AS (
-    SELECT 
+scored_signals AS (
+    SELECT
         *,
-        -- (Whitespace * ACV Proxy) + (Deployed Locations * Upgrade Delta)
-        ((location_whitespace * acv_proxy) + (COALESCE(crm_location_count, 0) * plan_upgrade_delta)) AS expansion_potential_index
+        ((location_whitespace * acv_proxy) + (COALESCE(crm_location_count, 0) * plan_upgrade_delta)) AS expansion_potential_index,
+        (market_footprint_percentile + market_rating_percentile) / 2.0 AS composite_influence_score
     FROM base_metrics
-),
-
-final_segments AS (
-    SELECT 
-        *,
-        ((market_footprint_percentile + market_rating_percentile) / 2.0) AS composite_influence_score,
-        
-        CASE 
-            WHEN company_id IS NOT NULL AND vendor_id IS NULL THEN 'PENDING_RESOLUTION'
-            
-            -- Route dynamically based on the calculated index being mathematically viable
-            WHEN company_id IS NOT NULL AND vendor_id IS NOT NULL 
-                 AND expansion_potential_index > 0
-            THEN 'EXPANSION_OPPORTUNITY'
-            
-            WHEN company_id IS NULL AND vendor_id IS NOT NULL 
-                 AND ((market_footprint_percentile + market_rating_percentile) / 2.0) >= 0.5 
-            THEN 'NET_NEW_TARGET'
-            
-            WHEN company_id IS NOT NULL AND vendor_id IS NOT NULL 
-                 AND location_whitespace <= 0
-                 AND ((market_footprint_percentile + market_rating_percentile) / 2.0) >= 0.8
-            THEN 'CREDIBLE_PARTNER'
-            
-            ELSE 'UNCLASSIFIED'
-        END AS gtm_segment
-    FROM expansion_scoring
 )
 
-SELECT * FROM final_segments
+SELECT * FROM scored_signals
